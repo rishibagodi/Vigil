@@ -29,6 +29,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.time.LocalDateTime
+import java.time.format.DateTimeFormatter
 
 class AssistActivity : ComponentActivity() {
     private var status by mutableStateOf("Starting…")
@@ -36,6 +38,7 @@ class AssistActivity : ComponentActivity() {
     private var reply by mutableStateOf("")
     private lateinit var stt: SpeechRecognizer
     private lateinit var tts: TextToSpeech
+    private val history = JSONArray()            // conversation for this session
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,8 +63,7 @@ class AssistActivity : ComponentActivity() {
                 heard = text
                 status = "Thinking…"
                 lifecycleScope.launch {
-                    reply = runCatching { withContext(Dispatchers.IO) { askLlm(text) } }
-                        .getOrElse { "Error: ${it.message}" }
+                    reply = runCatching { ask(text) }.getOrElse { "Error: ${it.message}" }
                     status = "Vigil"
                     tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "vigil")
                 }
@@ -113,7 +115,7 @@ class AssistActivity : ComponentActivity() {
 
     private fun listen() {
         tts.stop()
-        stt.cancel()                                                    // reset if already listening
+        stt.cancel()
         status = "Starting…"; heard = ""; reply = ""
         stt.startListening(
             Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
@@ -123,14 +125,54 @@ class AssistActivity : ComponentActivity() {
         )
     }
 
-    private fun askLlm(text: String): String {
+    // Conversation loop: LLM may call tools, we run them, then it gives the final spoken reply
+    private suspend fun ask(text: String): String {
+        history.put(JSONObject().put("role", "user").put("content", text))
+
+        repeat(3) {                                                    // max 3 tool rounds
+            val msg = withContext(Dispatchers.IO) { chat() }
+            val calls = msg.optJSONArray("tool_calls")
+
+            if (calls == null || calls.length() == 0) {                // final answer
+                val answer = msg.optString("content")
+                    .replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
+                history.put(JSONObject().put("role", "assistant").put("content", answer))
+                return answer
+            }
+
+            history.put(JSONObject()                                   // record the tool request
+                .put("role", "assistant")
+                .put("content", msg.optString("content", ""))
+                .put("tool_calls", calls))
+
+            for (i in 0 until calls.length()) {                        // run each tool on the phone
+                val call = calls.getJSONObject(i)
+                val fn = call.getJSONObject("function")
+                val args = JSONObject(fn.optString("arguments").ifBlank { "{}" })
+                val result = Tools.run(this, fn.getString("name"), args)
+                history.put(JSONObject()
+                    .put("role", "tool")
+                    .put("tool_call_id", call.getString("id"))
+                    .put("content", result))
+            }
+        }
+        return "Done."
+    }
+
+    // One request to the LLM with system prompt + history + tools
+    private fun chat(): JSONObject {
+        val now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, d MMM yyyy, h:mm a"))
+        val messages = JSONArray().put(JSONObject().put("role", "system").put("content",
+            "You are Vigil, a voice assistant on the user's Android phone. " +
+                    "Use the tools to act on the phone when asked. After a tool runs, confirm briefly. " +
+                    "Reply in 1-2 short spoken sentences. No markdown, no emojis. Current date and time: $now."))
+        for (i in 0 until history.length()) messages.put(history.get(i))
+
         val body = JSONObject()
             .put("model", BuildConfig.LLM_MODEL)
-            .put("reasoning_effort", "low")                             // faster replies
-            .put("messages", JSONArray()
-                .put(JSONObject().put("role", "system")
-                    .put("content", "You are Vigil, a helpful voice assistant. Reply in 1-2 short spoken sentences. No markdown, no emojis."))
-                .put(JSONObject().put("role", "user").put("content", text)))
+            .put("reasoning_effort", "low")
+            .put("messages", messages)
+            .put("tools", Tools.schema)
 
         val conn = URL("${BuildConfig.LLM_BASE_URL}/chat/completions").openConnection() as HttpURLConnection
         conn.requestMethod = "POST"
@@ -143,9 +185,7 @@ class AssistActivity : ComponentActivity() {
         val res = (if (ok) conn.inputStream else conn.errorStream).bufferedReader().use { it.readText() }
         if (!ok) error("HTTP ${conn.responseCode}: ${res.take(150)}")
 
-        return JSONObject(res).getJSONArray("choices").getJSONObject(0)
-            .getJSONObject("message").getString("content")
-            .replace(Regex("<think>[\\s\\S]*?</think>"), "").trim()
+        return JSONObject(res).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
     }
 
     override fun onDestroy() {
