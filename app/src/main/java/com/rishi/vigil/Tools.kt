@@ -1,6 +1,7 @@
 package com.rishi.vigil
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.app.NotificationManager
 import android.content.ContentUris
 import android.content.ContentValues
@@ -9,6 +10,8 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.location.Location
+import android.location.LocationManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
@@ -21,13 +24,20 @@ import android.provider.Settings
 import android.telephony.SmsManager
 import org.json.JSONArray
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlin.math.roundToInt
 
 object Tools {
+
+    // Tools that use the internet → must run off the main thread
+    val network = setOf("weather", "web_search")
 
     val schema = JSONArray("""
     [
@@ -109,7 +119,32 @@ object Tools {
           "title":{"type":"string"},
           "start":{"type":"string","description":"Local start time, format YYYY-MM-DDTHH:MM"},
           "duration_minutes":{"type":"integer","description":"Default 60"}},
-        "required":["title","start"]}}}
+        "required":["title","start"]}}},
+
+      {"type":"function","function":{"name":"weather",
+        "description":"Get current weather and daily forecast. Omit city to use the user's current location.",
+        "parameters":{"type":"object","properties":{
+          "city":{"type":"string","description":"City name, e.g. Bengaluru. Omit for current location"},
+          "days":{"type":"integer","description":"Forecast days 1-7, default 2"}},
+        "required":[]}}},
+
+      {"type":"function","function":{"name":"web_search",
+        "description":"Search the web for current information: news, sports scores, prices, recent events, or facts you are unsure about.",
+        "parameters":{"type":"object","properties":{
+          "query":{"type":"string"}},
+        "required":["query"]}}},
+
+      {"type":"function","function":{"name":"remember",
+        "description":"Save a fact the user asks you to remember long-term. Write it as one short self-contained sentence with exact dates, e.g. 'Bike service is on 5 Nov 2026'.",
+        "parameters":{"type":"object","properties":{
+          "fact":{"type":"string"}},
+        "required":["fact"]}}},
+
+      {"type":"function","function":{"name":"forget",
+        "description":"Delete saved facts that mention a keyword. Use 'everything' to delete all saved facts.",
+        "parameters":{"type":"object","properties":{
+          "about":{"type":"string","description":"Keyword, e.g. 'bike service', or 'everything'"}},
+        "required":["about"]}}}
     ]
     """)
 
@@ -276,6 +311,78 @@ object Tools {
                 "Added '$title' on ${start.format(timeFmt)}"
             }
 
+            "weather" -> {
+                val city = args.optString("city").trim()
+                val days = args.optInt("days", 2).coerceIn(1, 7)
+
+                // 1. Where? City name → coordinates, or the phone's location
+                val (lat, lon, place) = if (city.isNotEmpty()) {
+                    val r = JSONObject(httpGet("https://geocoding-api.open-meteo.com/v1/search?count=1&name=" +
+                            URLEncoder.encode(city, "UTF-8")))
+                        .optJSONArray("results")?.optJSONObject(0) ?: error("Couldn't find a place called $city")
+                    Triple(r.getDouble("latitude"), r.getDouble("longitude"), r.getString("name"))
+                } else {
+                    val loc = lastLocation(ctx)
+                    Triple(loc.latitude, loc.longitude, "your location")
+                }
+
+                // 2. Current conditions + daily forecast
+                val w = JSONObject(httpGet("https://api.open-meteo.com/v1/forecast?latitude=$lat&longitude=$lon" +
+                        "&current=temperature_2m,apparent_temperature,relative_humidity_2m,weather_code,wind_speed_10m" +
+                        "&daily=weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max" +
+                        "&timezone=auto&forecast_days=$days"))
+                val cur = w.getJSONObject("current")
+                val d = w.getJSONObject("daily")
+                val forecast = (0 until days).joinToString("; ") { i ->
+                    "${d.getJSONArray("time").getString(i)}: ${sky(d.getJSONArray("weather_code").getInt(i))}, " +
+                            "${d.getJSONArray("temperature_2m_min").getDouble(i).roundToInt()} to " +
+                            "${d.getJSONArray("temperature_2m_max").getDouble(i).roundToInt()} degrees, " +
+                            "${d.getJSONArray("precipitation_probability_max").optInt(i)} percent chance of rain"
+                }
+                "Weather at $place now: ${cur.getDouble("temperature_2m").roundToInt()} degrees, " +
+                        "feels like ${cur.getDouble("apparent_temperature").roundToInt()}, ${sky(cur.getInt("weather_code"))}, " +
+                        "humidity ${cur.getInt("relative_humidity_2m")} percent, wind ${cur.getDouble("wind_speed_10m").roundToInt()} km/h. " +
+                        "Forecast: $forecast"
+            }
+
+            "web_search" -> {
+                val body = JSONObject()
+                    .put("query", args.getString("query"))
+                    .put("search_depth", "basic")          // 1 credit per search
+                    .put("max_results", 3)
+                    .put("include_answer", true)
+                val res = JSONObject(httpPost("https://api.tavily.com/search", body.toString(),
+                    "Bearer ${BuildConfig.TAVILY_API_KEY}"))
+                val results = res.optJSONArray("results") ?: JSONArray()
+                val snippets = (0 until results.length()).joinToString("\n") { i ->
+                    results.getJSONObject(i).let { "- ${it.optString("title")}: ${it.optString("content").take(300)}" }
+                }
+                "Answer: ${res.optString("answer")}\nSources:\n$snippets"
+            }
+
+            "remember" -> {
+                val fact = args.getString("fact").trim()
+                val facts = Memory.all(ctx).toMutableList()
+                if (facts.none { it.equals(fact, ignoreCase = true) }) {
+                    facts += fact
+                    Memory.save(ctx, facts.takeLast(100))              // keep the latest 100
+                }
+                "Saved: $fact"
+            }
+
+            "forget" -> {
+                val about = args.getString("about").trim().lowercase()
+                val facts = Memory.all(ctx)
+                if (about == "everything" || about == "all") {
+                    Memory.save(ctx, emptyList())
+                    return@runCatching "Forgot everything (${facts.size} facts)"
+                }
+                val keep = facts.filterNot { it.lowercase().contains(about) }
+                Memory.save(ctx, keep)
+                if (keep.size == facts.size) "Nothing saved about $about"
+                else "Forgot ${facts.size - keep.size} fact(s) about $about"
+            }
+
             else -> "Unknown tool: $name"
         }
     }.getOrElse { "Failed: ${it.message}" }
@@ -315,4 +422,50 @@ object Tools {
         }
         return null
     }
+
+    // Most recent known location from any provider (permission checked first)
+    @SuppressLint("MissingPermission")
+    private fun lastLocation(ctx: Context): Location {
+        check(ctx.checkSelfPermission(Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED) {
+            "Location permission not granted. Open the Vigil app, step 1."
+        }
+        val lm = ctx.getSystemService(LocationManager::class.java)
+        return listOf("fused", LocationManager.NETWORK_PROVIDER, LocationManager.GPS_PROVIDER)
+            .mapNotNull { runCatching { lm.getLastKnownLocation(it) }.getOrNull() }
+            .maxByOrNull { it.time }
+            ?: error("Couldn't get your location. Turn on location, or say a city name.")
+    }
+
+    // WMO weather code → words
+    private fun sky(code: Int) = when (code) {
+        0 -> "clear sky"
+        1, 2 -> "partly cloudy"
+        3 -> "overcast"
+        45, 48 -> "foggy"
+        in 51..57 -> "drizzle"
+        in 61..67 -> "rain"
+        in 71..77 -> "snow"
+        in 80..82 -> "rain showers"
+        85, 86 -> "snow showers"
+        in 95..99 -> "thunderstorm"
+        else -> "unknown conditions"
+    }
+
+    private fun httpGet(url: String): String =
+        (URL(url).openConnection() as HttpURLConnection).run {
+            connectTimeout = 10_000; readTimeout = 10_000
+            check(responseCode in 200..299) { "HTTP $responseCode" }
+            inputStream.bufferedReader().use { it.readText() }
+        }
+
+    private fun httpPost(url: String, json: String, auth: String): String =
+        (URL(url).openConnection() as HttpURLConnection).run {
+            requestMethod = "POST"; doOutput = true
+            connectTimeout = 10_000; readTimeout = 15_000
+            setRequestProperty("Content-Type", "application/json")
+            setRequestProperty("Authorization", auth)
+            outputStream.use { it.write(json.toByteArray()) }
+            check(responseCode in 200..299) { "HTTP $responseCode" }
+            inputStream.bufferedReader().use { it.readText() }
+        }
 }

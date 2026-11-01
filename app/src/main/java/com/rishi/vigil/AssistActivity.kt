@@ -174,8 +174,12 @@ class AssistActivity : ComponentActivity() {
             for (i in 0 until calls.length()) {
                 val call = calls.getJSONObject(i)
                 val fn = call.getJSONObject("function")
-                val result = Tools.run(this, fn.getString("name"),
-                    JSONObject(fn.optString("arguments").ifBlank { "{}" }))
+                val name = fn.getString("name")
+                val args = JSONObject(fn.optString("arguments").ifBlank { "{}" })
+                val ctx = this@AssistActivity
+                val result = if (name in Tools.network)
+                    withContext(Dispatchers.IO) { Tools.run(ctx, name, args) }   // internet tools off main thread
+                else Tools.run(ctx, name, args)
 
                 // Opened an app or started a call → Vigil should close
                 if (result.startsWith("Opened") || result.startsWith("Calling")) closeAfter = true
@@ -191,15 +195,25 @@ class AssistActivity : ComponentActivity() {
         return "Done."
     }
 
-    // One request to the LLM with system prompt + history + tools
+    // One request to the LLM with system prompt + saved memory + history + tools
     private fun chat(): JSONObject {
         val now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, d MMM yyyy, h:mm a"))
+        val facts = Memory.all(this)
+        val memoryText = if (facts.isEmpty()) "Nothing saved yet."
+        else facts.mapIndexed { i, f -> "${i + 1}. $f" }.joinToString("\n")
+
         val messages = JSONArray().put(JSONObject().put("role", "system").put("content",
             "You are Vigil, a voice assistant on the user's Android phone. " +
                     "Use the tools to act on the phone when asked. If the user asks for several things, " +
                     "call every tool needed, then confirm all of them in one short reply. " +
                     "Use earlier messages in this conversation to understand follow-ups like 'make it 7' or 'turn it off'. " +
-                    "Reply in 1-2 short spoken sentences. No markdown, no emojis. Current date and time: $now."))
+                    "For weather use the weather tool. For news, scores, prices or anything recent, use web_search " +
+                    "and summarise the answer; never read out URLs. " +
+                    "When the user says 'remember ...', use the remember tool and convert relative dates like " +
+                    "'tomorrow' or 'the 5th' into exact dates. Answer questions about saved facts from long-term memory below. " +
+                    "Only bring up saved facts when they are relevant. " +
+                    "Reply in 1-2 short spoken sentences. No markdown, no emojis. Current date and time: $now.\n\n" +
+                    "Long-term memory (facts the user asked you to remember):\n$memoryText"))
         for (i in 0 until history.length()) messages.put(history.get(i))
 
         val body = JSONObject()

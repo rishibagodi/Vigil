@@ -25,6 +25,7 @@ android {
         buildConfigField("String", "LLM_BASE_URL", "\"${localProps.getProperty("LLM_BASE_URL")}\"")
         buildConfigField("String", "LLM_API_KEY", "\"${localProps.getProperty("LLM_API_KEY")}\"")
         buildConfigField("String", "LLM_MODEL", "\"${localProps.getProperty("LLM_MODEL")}\"")
+        buildConfigField("String", "TAVILY_API_KEY", "\"${localProps.getProperty("TAVILY_API_KEY")}\"")
     }
 
     buildTypes {
