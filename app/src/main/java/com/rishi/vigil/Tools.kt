@@ -2,7 +2,9 @@ package com.rishi.vigil
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.app.Notification
 import android.app.NotificationManager
+import android.content.ComponentName
 import android.content.ContentUris
 import android.content.ContentValues
 import android.content.Context
@@ -21,7 +23,10 @@ import android.provider.CalendarContract.Events
 import android.provider.CalendarContract.Instances
 import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.provider.Settings
+import android.service.notification.NotificationListenerService
 import android.telephony.SmsManager
+import androidx.core.app.NotificationCompat
+import androidx.core.app.NotificationManagerCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -38,6 +43,9 @@ object Tools {
 
     // Tools that use the internet → must run off the main thread
     val network = setOf("weather", "web_search")
+
+    // One notification, simplified
+    data class Notif(val app: String, val pkg: String, val title: String, val text: String)
 
     val schema = JSONArray("""
     [
@@ -144,7 +152,21 @@ object Tools {
         "description":"Delete saved facts that mention a keyword. Use 'everything' to delete all saved facts.",
         "parameters":{"type":"object","properties":{
           "about":{"type":"string","description":"Keyword, e.g. 'bike service', or 'everything'"}},
-        "required":["about"]}}}
+        "required":["about"]}}},
+
+      {"type":"function","function":{"name":"read_notifications",
+        "description":"Read the user's current notifications and messages (WhatsApp, SMS, email, alerts). ALWAYS call this again for every question about messages or notifications, even if you checked earlier in the conversation, because they change constantly. If nothing matches the filter, the result lists all current notifications; use it to answer anyway (names may be spelled differently). Summarise briefly for speech.",
+        "parameters":{"type":"object","properties":{
+          "app":{"type":"string","description":"App name to filter by, e.g. WhatsApp. Omit for all apps"},
+          "from":{"type":"string","description":"Sender or chat name to filter by, e.g. Rahul. Omit for everyone"},
+          "limit":{"type":"integer","description":"Max notifications to return, default 10"}},
+        "required":[]}}},
+
+      {"type":"function","function":{"name":"clear_notifications",
+        "description":"Dismiss the user's notifications, optionally only from one app.",
+        "parameters":{"type":"object","properties":{
+          "app":{"type":"string","description":"App name, e.g. Instagram. Omit to clear all"}},
+        "required":[]}}}
     ]
     """)
 
@@ -383,6 +405,40 @@ object Tools {
                 else "Forgot ${facts.size - keep.size} fact(s) about $about"
             }
 
+            "read_notifications" -> {
+                val app = args.optString("app").trim()
+                val from = args.optString("from").trim()
+                val limit = args.optInt("limit", 10).coerceIn(1, 20)
+                val all = notifications(ctx)
+                val matches = all.filter {
+                    (app.isEmpty() || it.app.contains(app, ignoreCase = true) ||
+                            it.pkg.contains(app.replace(" ", ""), ignoreCase = true)) &&
+                            (from.isEmpty() || looselyMatches(from, it.title) || looselyMatches(from, it.text))
+                }
+                when {
+                    matches.isNotEmpty() ->
+                        "${matches.size} matching notification(s), newest first: " +
+                                matches.take(limit).joinToString("; ") { "${it.app}, ${it.title}: ${it.text.take(300)}" }
+                    all.isEmpty() ->
+                        "There are no notifications at all right now"
+                    else ->                                            // nothing matched → show everything so the LLM can still help
+                        "Nothing matched app='$app' from='$from'. All current notifications: " +
+                                all.take(limit).joinToString("; ") { "${it.app}, ${it.title}: ${it.text.take(150)}" }
+                }
+            }
+
+            "clear_notifications" -> {
+                val svc = listener(ctx)
+                val app = args.optString("app").trim()
+                val matches = svc.activeNotifications.filter {
+                    it.isClearable && (app.isEmpty() ||
+                            appName(ctx, it.packageName).contains(app, ignoreCase = true) ||
+                            it.packageName.contains(app.replace(" ", ""), ignoreCase = true))
+                }
+                matches.forEach { svc.cancelNotification(it.key) }
+                "Cleared ${matches.size} notification(s)"
+            }
+
             else -> "Unknown tool: $name"
         }
     }.getOrElse { "Failed: ${it.message}" }
@@ -435,6 +491,59 @@ object Tools {
             .maxByOrNull { it.time }
             ?: error("Couldn't get your location. Turn on location, or say a city name.")
     }
+
+    // The connected notification listener, or a clear reason why it isn't available
+    private fun listener(ctx: Context): VigilNotificationService {
+        VigilNotificationService.instance?.let { return it }
+        check(NotificationManagerCompat.getEnabledListenerPackages(ctx).contains(ctx.packageName)) {
+            "Notification access not granted. Open the Vigil app, step 5."
+        }
+        // Access is on but Android hasn't connected the listener yet → ask it to reconnect
+        NotificationListenerService.requestRebind(ComponentName(ctx, VigilNotificationService::class.java))
+        error("Notification access is starting up. Try again in a moment.")
+    }
+
+    // All current notifications, newest first, with chat messages and their senders
+    private fun notifications(ctx: Context): List<Notif> =
+        listener(ctx).activeNotifications
+            .filter {
+                !it.isOngoing &&                                                   // skip music players, downloads…
+                        it.packageName != ctx.packageName &&                               // skip Vigil's own
+                        (it.notification.flags and Notification.FLAG_GROUP_SUMMARY) == 0   // skip "5 new messages" summaries
+            }
+            .sortedByDescending { it.postTime }
+            .mapNotNull { sbn ->
+                val ex = sbn.notification.extras
+                val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+
+                // WhatsApp & other chat apps: read each message with its sender (works for group chats too)
+                val chat = NotificationCompat.MessagingStyle
+                    .extractMessagingStyleFromNotification(sbn.notification)
+                    ?.messages?.takeLast(5)
+                    ?.joinToString(" | ") { m -> "${m.person?.name ?: title}: ${m.text}" }
+                    ?.takeIf { it.isNotBlank() }
+
+                val text = chat ?: (ex.getCharSequence(Notification.EXTRA_BIG_TEXT)
+                    ?: ex.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
+
+                if (title.isBlank() && text.isBlank()) null
+                else Notif(appName(ctx, sbn.packageName), sbn.packageName, title, text)
+            }
+
+    // "Chinni" matches "Chinni ❤️", "chinni", "Chinnu" (same first 4 letters) or a group message from Chinni
+    private fun looselyMatches(query: String, target: String): Boolean {
+        val q = query.lowercase().filter { it.isLetterOrDigit() }
+        if (q.isEmpty()) return true
+        val t = target.lowercase()
+        if (t.filter { it.isLetterOrDigit() }.contains(q)) return true
+        return q.length >= 4 && t.split(Regex("[^\\p{L}\\p{N}]+")).any { it.startsWith(q.take(4)) }
+    }
+
+    // Package name → readable app name ("com.whatsapp" → "WhatsApp")
+    private fun appName(ctx: Context, pkg: String): String = runCatching {
+        val pm = ctx.packageManager
+        pm.getApplicationLabel(pm.getApplicationInfo(pkg, 0)).toString()
+    }.getOrDefault(pkg)
 
     // WMO weather code → words
     private fun sky(code: Int) = when (code) {

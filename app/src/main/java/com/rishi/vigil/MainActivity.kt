@@ -76,6 +76,10 @@ class MainActivity : ComponentActivity() {
                         Text("4. Allow brightness control")
                     }
 
+                    Button({ startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS)) }, Modifier.fillMaxWidth()) {
+                        Text("5. Allow notification access")
+                    }
+
                     HorizontalDivider()
 
                     // Custom vocabulary for Whisper
