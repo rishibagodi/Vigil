@@ -7,6 +7,7 @@ import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.background
@@ -40,10 +41,24 @@ class AssistActivity : ComponentActivity() {
     private lateinit var tts: TextToSpeech
     private val history = JSONArray()                // conversation for this session
     private var closeAfter = false                    // true when we handed off to another app
+    private var followUp = false                      // true when the mic reopened by itself
+
+    // Whole-utterance phrases that mean "I'm done"
+    private val stopWords = Regex("^(stop|cancel|thanks|thank you|that's all|that is all|bye|goodbye|nothing|no|no thanks|ok bye)[.!]?$")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         tts = TextToSpeech(this) {}
+
+        // When Vigil finishes speaking, reopen the mic for a follow-up
+        tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onDone(utteranceId: String?) {
+                runOnUiThread { if (!isFinishing) listen(auto = true) }
+            }
+            override fun onStart(utteranceId: String?) {}
+            @Deprecated("Deprecated in Java")
+            override fun onError(utteranceId: String?) {}
+        })
 
         // Vigil is the default assistant, so the "default" recognizer is our empty stub.
         // Use the phone's on-device recognizer instead.
@@ -52,7 +67,9 @@ class AssistActivity : ComponentActivity() {
         else SpeechRecognizer.createSpeechRecognizer(this)
 
         stt.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) { status = "Listening… speak now" }
+            override fun onReadyForSpeech(params: Bundle?) {
+                status = if (followUp) "Anything else? (say \"stop\" to close)" else "Listening… speak now"
+            }
 
             override fun onPartialResults(partialResults: Bundle?) {
                 partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
@@ -61,6 +78,8 @@ class AssistActivity : ComponentActivity() {
 
             override fun onResults(results: Bundle) {
                 val text = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
+                if (stopWords.matches(text.lowercase().trim())) { finish(); return }   // natural stop
+
                 heard = text
                 status = "Thinking…"
                 lifecycleScope.launch {
@@ -72,12 +91,14 @@ class AssistActivity : ComponentActivity() {
             }
 
             override fun onError(error: Int) {
-                status = when (error) {
-                    SpeechRecognizer.ERROR_NO_MATCH,
-                    SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "I didn't hear anything. Tap to try again."
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission missing. Open Vigil app → Allow permissions."
-                    SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
-                    SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Download English (India) in Settings → Speech → On-device recognition."
+                val silent = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
+                if (silent && followUp) { finish(); return }          // no follow-up → close
+
+                status = when {
+                    silent -> "I didn't hear anything. Tap to try again."
+                    error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission missing. Open Vigil app → Allow permissions."
+                    error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
+                            error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Download English (India) in Settings → Speech → On-device recognition."
                     else -> "Error $error. Tap to try again."
                 }
             }
@@ -115,10 +136,13 @@ class AssistActivity : ComponentActivity() {
         }
     }
 
-    private fun listen() {
+    // auto = true when the mic reopens by itself after Vigil spoke
+    private fun listen(auto: Boolean = false) {
+        followUp = auto
         tts.stop()
         stt.cancel()
-        status = "Starting…"; heard = ""; reply = ""
+        status = "Starting…"; heard = ""
+        if (!auto) reply = ""                           // keep last reply visible during follow-up
         stt.startListening(
             Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
@@ -131,7 +155,7 @@ class AssistActivity : ComponentActivity() {
     private suspend fun ask(text: String): String {
         history.put(JSONObject().put("role", "user").put("content", text))
 
-        repeat(3) {                                                    // max 3 tool rounds
+        repeat(5) {                                                    // max 5 tool rounds (multi-step)
             val msg = withContext(Dispatchers.IO) { chat() }
             val calls = msg.optJSONArray("tool_calls")
 
@@ -172,7 +196,9 @@ class AssistActivity : ComponentActivity() {
         val now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, d MMM yyyy, h:mm a"))
         val messages = JSONArray().put(JSONObject().put("role", "system").put("content",
             "You are Vigil, a voice assistant on the user's Android phone. " +
-                    "Use the tools to act on the phone when asked. After a tool runs, confirm briefly. " +
+                    "Use the tools to act on the phone when asked. If the user asks for several things, " +
+                    "call every tool needed, then confirm all of them in one short reply. " +
+                    "Use earlier messages in this conversation to understand follow-ups like 'make it 7' or 'turn it off'. " +
                     "Reply in 1-2 short spoken sentences. No markdown, no emojis. Current date and time: $now."))
         for (i in 0 until history.length()) messages.put(history.get(i))
 
