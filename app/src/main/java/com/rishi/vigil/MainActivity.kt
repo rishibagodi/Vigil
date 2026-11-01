@@ -16,7 +16,7 @@ import androidx.compose.ui.unit.dp
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val askMic = registerForActivityResult(ActivityResultContracts.RequestPermission()) {}
+        val askPerms = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {}
 
         setContent {
             MaterialTheme {
@@ -25,8 +25,15 @@ class MainActivity : ComponentActivity() {
                     verticalArrangement = Arrangement.spacedBy(16.dp, Alignment.CenterVertically)
                 ) {
                     Text("Vigil Setup", style = MaterialTheme.typography.headlineMedium)
-                    Button({ askMic.launch(Manifest.permission.RECORD_AUDIO) }, Modifier.fillMaxWidth()) {
-                        Text("1. Allow microphone")
+                    Button({
+                        askPerms.launch(arrayOf(
+                            Manifest.permission.RECORD_AUDIO,
+                            Manifest.permission.READ_CONTACTS,
+                            Manifest.permission.CALL_PHONE,
+                            Manifest.permission.SEND_SMS
+                        ))
+                    }, Modifier.fillMaxWidth()) {
+                        Text("1. Allow permissions (mic, contacts, phone, SMS)")
                     }
                     Button({ startActivity(Intent(Settings.ACTION_MANAGE_DEFAULT_APPS_SETTINGS)) }, Modifier.fillMaxWidth()) {
                         Text("2. Set Vigil as Digital assistant")

@@ -38,7 +38,8 @@ class AssistActivity : ComponentActivity() {
     private var reply by mutableStateOf("")
     private lateinit var stt: SpeechRecognizer
     private lateinit var tts: TextToSpeech
-    private val history = JSONArray()            // conversation for this session
+    private val history = JSONArray()                // conversation for this session
+    private var closeAfter = false                    // true when we handed off to another app
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -64,6 +65,7 @@ class AssistActivity : ComponentActivity() {
                 status = "Thinking…"
                 lifecycleScope.launch {
                     reply = runCatching { ask(text) }.getOrElse { "Error: ${it.message}" }
+                    if (closeAfter) { finish(); return@launch }      // get out of the way of the call/app
                     status = "Vigil"
                     tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "vigil")
                 }
@@ -73,9 +75,9 @@ class AssistActivity : ComponentActivity() {
                 status = when (error) {
                     SpeechRecognizer.ERROR_NO_MATCH,
                     SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> "I didn't hear anything. Tap to try again."
-                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission missing. Open Vigil app → Allow microphone."
+                    SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission missing. Open Vigil app → Allow permissions."
                     SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
-                    SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Download English in Settings → Speech → On-device recognition."
+                    SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Download English (India) in Settings → Speech → On-device recognition."
                     else -> "Error $error. Tap to try again."
                 }
             }
@@ -120,7 +122,7 @@ class AssistActivity : ComponentActivity() {
         stt.startListening(
             Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
                 .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US")
+                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
                 .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
         )
     }
@@ -145,16 +147,22 @@ class AssistActivity : ComponentActivity() {
                 .put("content", msg.optString("content", ""))
                 .put("tool_calls", calls))
 
-            for (i in 0 until calls.length()) {                        // run each tool on the phone
+            for (i in 0 until calls.length()) {
                 val call = calls.getJSONObject(i)
                 val fn = call.getJSONObject("function")
-                val args = JSONObject(fn.optString("arguments").ifBlank { "{}" })
-                val result = Tools.run(this, fn.getString("name"), args)
+                val result = Tools.run(this, fn.getString("name"),
+                    JSONObject(fn.optString("arguments").ifBlank { "{}" }))
+
+                // Opened an app or started a call → Vigil should close
+                if (result.startsWith("Opened") || result.startsWith("Calling")) closeAfter = true
+
                 history.put(JSONObject()
                     .put("role", "tool")
                     .put("tool_call_id", call.getString("id"))
                     .put("content", result))
             }
+
+            if (closeAfter) return "Done."
         }
         return "Done."
     }
