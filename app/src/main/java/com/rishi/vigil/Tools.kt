@@ -4,6 +4,7 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationManager
+import android.app.RemoteInput
 import android.content.ComponentName
 import android.content.ContentUris
 import android.content.ContentValues
@@ -17,6 +18,7 @@ import android.location.LocationManager
 import android.media.AudioManager
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.CalendarContract.Calendars
 import android.provider.CalendarContract.Events
@@ -24,6 +26,7 @@ import android.provider.CalendarContract.Instances
 import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.provider.Settings
 import android.service.notification.NotificationListenerService
+import android.service.notification.StatusBarNotification
 import android.telephony.SmsManager
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
@@ -83,7 +86,7 @@ object Tools {
         "required":["name"]}}},
 
       {"type":"function","function":{"name":"send_sms",
-        "description":"Send an SMS to a contact by name, or a phone number.",
+        "description":"Send an SMS text message to a contact by name, or a phone number. Only use when the user asks for an SMS or text message, not for WhatsApp or other chat apps.",
         "parameters":{"type":"object","properties":{
           "name":{"type":"string","description":"Contact name as saved, or a phone number"},
           "message":{"type":"string","description":"The text to send"}},
@@ -166,7 +169,15 @@ object Tools {
         "description":"Dismiss the user's notifications, optionally only from one app.",
         "parameters":{"type":"object","properties":{
           "app":{"type":"string","description":"App name, e.g. Instagram. Omit to clear all"}},
-        "required":[]}}}
+        "required":[]}}},
+
+      {"type":"function","function":{"name":"reply_message",
+        "description":"Reply to a chat message on WhatsApp, Telegram, Instagram, Google Messages or similar, using the Reply button in that chat's notification. Use for 'reply to X', 'tell X on WhatsApp', 'message X back'. Only works if that chat currently has a notification. If it fails, tell the user; do NOT send an SMS instead.",
+        "parameters":{"type":"object","properties":{
+          "to":{"type":"string","description":"Chat or sender name, e.g. Chinni"},
+          "message":{"type":"string","description":"The reply text"},
+          "app":{"type":"string","description":"Optional app name, e.g. WhatsApp"}},
+        "required":["to","message"]}}}
     ]
     """)
 
@@ -439,6 +450,37 @@ object Tools {
                 "Cleared ${matches.size} notification(s)"
             }
 
+            "reply_message" -> {
+                val to = args.getString("to").trim()
+                val message = args.getString("message").trim()
+                val app = args.optString("app").trim()
+
+                // Chat notifications that have a Reply button, newest first
+                val chats = listener(ctx).activeNotifications
+                    .filter {
+                        it.packageName != ctx.packageName &&
+                                (it.notification.flags and Notification.FLAG_GROUP_SUMMARY) == 0 &&
+                                (app.isEmpty() || appName(ctx, it.packageName).contains(app, ignoreCase = true) ||
+                                        it.packageName.contains(app.replace(" ", ""), ignoreCase = true))
+                    }
+                    .sortedByDescending { it.postTime }
+                    .mapNotNull { sbn -> replyAction(sbn.notification)?.let { sbn to it } }
+
+                // Match the chat name first, then a sender inside a group chat
+                val (sbn, action) = chats.firstOrNull { looselyMatches(to, titleOf(it.first)) }
+                    ?: chats.firstOrNull { looselyMatches(to, textOf(it.first)) }
+                    ?: error("No chat from $to with a Reply button is in the notifications right now. " +
+                            "Tell the user to open the app and reply there. Do not send an SMS instead.")
+
+                // Fill the Reply box and press Reply
+                val results = Bundle().apply { action.remoteInputs.forEach { putCharSequence(it.resultKey, message) } }
+                val fill = Intent()
+                RemoteInput.addResultsToIntent(action.remoteInputs, fill, results)
+                action.actionIntent.send(ctx, 0, fill)
+
+                "Replied to ${titleOf(sbn)} on ${appName(ctx, sbn.packageName)}: $message"
+            }
+
             else -> "Unknown tool: $name"
         }
     }.getOrElse { "Failed: ${it.message}" }
@@ -513,22 +555,36 @@ object Tools {
             }
             .sortedByDescending { it.postTime }
             .mapNotNull { sbn ->
-                val ex = sbn.notification.extras
-                val title = ex.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
-
-                // WhatsApp & other chat apps: read each message with its sender (works for group chats too)
-                val chat = NotificationCompat.MessagingStyle
-                    .extractMessagingStyleFromNotification(sbn.notification)
-                    ?.messages?.takeLast(5)
-                    ?.joinToString(" | ") { m -> "${m.person?.name ?: title}: ${m.text}" }
-                    ?.takeIf { it.isNotBlank() }
-
-                val text = chat ?: (ex.getCharSequence(Notification.EXTRA_BIG_TEXT)
-                    ?: ex.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
-
+                val title = titleOf(sbn)
+                val text = textOf(sbn)
                 if (title.isBlank() && text.isBlank()) null
                 else Notif(appName(ctx, sbn.packageName), sbn.packageName, title, text)
             }
+
+    // Notification title: the chat or sender name for messaging apps
+    private fun titleOf(sbn: StatusBarNotification): String =
+        sbn.notification.extras.getCharSequence(Notification.EXTRA_TITLE)?.toString().orEmpty()
+
+    // Notification text; for chat apps, the last few messages with their senders
+    private fun textOf(sbn: StatusBarNotification): String {
+        val chat = NotificationCompat.MessagingStyle
+            .extractMessagingStyleFromNotification(sbn.notification)
+            ?.messages?.takeLast(5)
+            ?.joinToString(" | ") { m -> "${m.person?.name ?: titleOf(sbn)}: ${m.text}" }
+            ?.takeIf { it.isNotBlank() }
+        val ex = sbn.notification.extras
+        return chat ?: (ex.getCharSequence(Notification.EXTRA_BIG_TEXT)
+            ?: ex.getCharSequence(Notification.EXTRA_TEXT))?.toString().orEmpty()
+    }
+
+    // The notification's Reply action (a button with a free-text box), if it has one
+    private fun replyAction(n: Notification): Notification.Action? {
+        val all = (n.actions?.toList() ?: emptyList()) + Notification.WearableExtender(n).actions
+        return all
+            .filter { a -> a.remoteInputs?.any { it.allowFreeFormInput } == true }
+            .sortedByDescending { it.semanticAction == Notification.Action.SEMANTIC_ACTION_REPLY }
+            .firstOrNull()
+    }
 
     // "Chinni" matches "Chinni ❤️", "chinni", "Chinnu" (same first 4 letters) or a group message from Chinni
     private fun looselyMatches(query: String, target: String): Boolean {
