@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.Settings
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -20,10 +21,12 @@ import androidx.compose.ui.unit.dp
 
 class MainActivity : ComponentActivity() {
     private var facts by mutableStateOf(listOf<String>())
+    private var words by mutableStateOf("")
 
     override fun onResume() {
         super.onResume()
         facts = Memory.all(this)                       // refresh every time the app is opened
+        words = Memory.words(this)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -65,6 +68,25 @@ class MainActivity : ComponentActivity() {
                         startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
                     }, Modifier.fillMaxWidth()) {
                         Text("4. Allow brightness control")
+                    }
+
+                    HorizontalDivider()
+
+                    // Custom vocabulary for Whisper
+                    Text("Words Vigil should recognise", style = MaterialTheme.typography.titleMedium)
+                    Text("Places, names or terms it mishears, separated by commas.",
+                        style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(
+                        value = words,
+                        onValueChange = { words = it },
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("Yelachenahalli, Koramangala, Royal Enfield") }
+                    )
+                    Button({
+                        Memory.saveWords(this@MainActivity, words)
+                        Toast.makeText(this@MainActivity, "Words saved", Toast.LENGTH_SHORT).show()
+                    }, Modifier.fillMaxWidth()) {
+                        Text("Save words")
                     }
 
                     HorizontalDivider()

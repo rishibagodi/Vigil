@@ -1,11 +1,13 @@
 package com.rishi.vigil
 
-import android.content.Intent
-import android.os.Build
+import android.Manifest
+import android.annotation.SuppressLint
+import android.content.pm.PackageManager
+import android.media.AudioFormat
+import android.media.AudioRecord
+import android.media.MediaRecorder
 import android.os.Bundle
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
+import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import androidx.activity.ComponentActivity
@@ -16,6 +18,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
@@ -23,28 +26,45 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.ByteArrayOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
+import kotlin.math.sqrt
+
+// Whisper runs on Groq with the same key as the LLM
+private const val GROQ_URL = "https://api.groq.com/openai/v1"
+
+// Groq rate limits are per model, so if one is busy we try the other
+private val FALLBACK_MODELS = listOf("openai/gpt-oss-20b", "openai/gpt-oss-120b")
 
 class AssistActivity : ComponentActivity() {
     private var status by mutableStateOf("Starting…")
     private var heard by mutableStateOf("")
     private var reply by mutableStateOf("")
-    private lateinit var stt: SpeechRecognizer
+    private var recording by mutableStateOf(false)
+    private var level by mutableFloatStateOf(0f)       // mic loudness 0..1 for the UI bar
     private lateinit var tts: TextToSpeech
-    private val history = JSONArray()                // conversation for this session
-    private var closeAfter = false                    // true when we handed off to another app
-    private var followUp = false                      // true when the mic reopened by itself
+    private val history = JSONArray()                 // conversation for this session
+    private var closeAfter = false                     // true when we handed off to another app
+    private var followUp = false                       // true when the mic reopened by itself
+    private var listenJob: Job? = null
+    private var contactHint = ""                       // contact names → helps Whisper spell them
 
-    // Whole-utterance phrases that mean "I'm done"
-    private val stopWords = Regex("^(stop|cancel|thanks|thank you|that's all|that is all|bye|goodbye|nothing|no|no thanks|ok bye)[.!]?$")
+    // Whole-utterance phrases that mean "I'm done" (checked after removing punctuation)
+    private val stopWords = Regex("^(stop|cancel|thanks|thank you|thats all|that is all|bye|goodbye|nothing|no|no thanks|ok bye)$")
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -60,56 +80,7 @@ class AssistActivity : ComponentActivity() {
             override fun onError(utteranceId: String?) {}
         })
 
-        // Vigil is the default assistant, so the "default" recognizer is our empty stub.
-        // Use the phone's on-device recognizer instead.
-        stt = if (Build.VERSION.SDK_INT >= 31 && SpeechRecognizer.isOnDeviceRecognitionAvailable(this))
-            SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
-        else SpeechRecognizer.createSpeechRecognizer(this)
-
-        stt.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) {
-                status = if (followUp) "Anything else? (say \"stop\" to close)" else "Listening… speak now"
-            }
-
-            override fun onPartialResults(partialResults: Bundle?) {
-                partialResults?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    ?.firstOrNull()?.let { heard = it }
-            }
-
-            override fun onResults(results: Bundle) {
-                val text = results.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)?.firstOrNull() ?: return
-                if (stopWords.matches(text.lowercase().trim())) { finish(); return }   // natural stop
-
-                heard = text
-                status = "Thinking…"
-                lifecycleScope.launch {
-                    reply = runCatching { ask(text) }.getOrElse { "Error: ${it.message}" }
-                    if (closeAfter) { finish(); return@launch }      // get out of the way of the call/app
-                    status = "Vigil"
-                    tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "vigil")
-                }
-            }
-
-            override fun onError(error: Int) {
-                val silent = error == SpeechRecognizer.ERROR_NO_MATCH || error == SpeechRecognizer.ERROR_SPEECH_TIMEOUT
-                if (silent && followUp) { finish(); return }          // no follow-up → close
-
-                status = when {
-                    silent -> "I didn't hear anything. Tap to try again."
-                    error == SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> "Mic permission missing. Open Vigil app → Allow permissions."
-                    error == SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED ||
-                            error == SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> "Download English (India) in Settings → Speech → On-device recognition."
-                    else -> "Error $error. Tap to try again."
-                }
-            }
-
-            override fun onEndOfSpeech() { status = "Processing…" }
-            override fun onBeginningOfSpeech() {}
-            override fun onRmsChanged(rmsdB: Float) {}
-            override fun onBufferReceived(buffer: ByteArray?) {}
-            override fun onEvent(eventType: Int, params: Bundle?) {}
-        })
-
+        lifecycleScope.launch(Dispatchers.IO) { contactHint = contactNames() }
         listen()
 
         setContent {
@@ -127,6 +98,7 @@ class AssistActivity : ComponentActivity() {
                     ) {
                         Column(Modifier.padding(24.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                             Text(status, style = MaterialTheme.typography.titleLarge)
+                            if (recording) LinearProgressIndicator(progress = { level }, modifier = Modifier.fillMaxWidth())
                             if (heard.isNotEmpty()) Text("You: $heard", style = MaterialTheme.typography.bodyLarge)
                             if (reply.isNotEmpty()) Text(reply, style = MaterialTheme.typography.bodyLarge)
                         }
@@ -140,15 +112,163 @@ class AssistActivity : ComponentActivity() {
     private fun listen(auto: Boolean = false) {
         followUp = auto
         tts.stop()
-        stt.cancel()
-        status = "Starting…"; heard = ""
-        if (!auto) reply = ""                           // keep last reply visible during follow-up
-        stt.startListening(
-            Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
-                .putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
-        )
+        listenJob?.cancel()                                           // stop any recording in progress
+        heard = ""
+        if (!auto) reply = ""                                         // keep last reply visible during follow-up
+        status = if (auto) "Anything else? (say \"stop\" to close)" else "Listening… speak now"
+
+        listenJob = lifecycleScope.launch {
+            // 1. Record until you stop talking
+            val wav = runCatching { withContext(Dispatchers.IO) { record(if (auto) 5_000 else 8_000) } }
+                .getOrElse {
+                    if (it is CancellationException) throw it
+                    status = "Mic error: ${it.message}. Tap to try again."
+                    return@launch
+                }
+            if (wav == null) {                                        // nobody spoke
+                if (followUp) finish() else status = "I didn't hear anything. Tap to try again."
+                return@launch
+            }
+
+            // 2. Speech → text with Whisper
+            status = "Transcribing…"
+            val text = runCatching { withContext(Dispatchers.IO) { transcribe(wav) } }
+                .getOrElse {
+                    if (it is CancellationException) throw it
+                    status = "Couldn't transcribe (${it.message}). Tap to try again."
+                    return@launch
+                }
+            if (text.isBlank()) { status = "I didn't catch that. Tap to try again."; return@launch }
+
+            // 3. Same flow as before
+            onHeard(text)
+        }
+    }
+
+    private suspend fun onHeard(text: String) {
+        val plain = text.lowercase().replace(Regex("[^a-z ]"), "").trim()
+        if (stopWords.matches(plain)) { finish(); return }            // natural stop
+
+        heard = text
+        status = "Thinking…"
+        reply = runCatching { ask(text) }.getOrElse {
+            if (it is CancellationException) throw it
+            "Error: ${it.message}"
+        }
+        if (closeAfter) { finish(); return }                          // get out of the way of the call/app
+        status = "Vigil"
+        tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "vigil")
+    }
+
+    // Records 16 kHz mono audio. Returns WAV bytes, or null if nobody spoke within waitMs.
+    @SuppressLint("MissingPermission")
+    private suspend fun record(waitMs: Int): ByteArray? {
+        val rate = 16_000
+        val chunk = rate / 10                                         // 100 ms of samples
+        val minBuf = AudioRecord.getMinBufferSize(rate, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+        val rec = AudioRecord(MediaRecorder.AudioSource.VOICE_RECOGNITION, rate,
+            AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT, maxOf(minBuf, chunk * 8))
+        check(rec.state == AudioRecord.STATE_INITIALIZED) { "microphone unavailable" }
+
+        val pcm = ByteArrayOutputStream()
+        val buf = ShortArray(chunk)
+        var prev: ByteArray? = null                                   // 100 ms pre-roll so the first word isn't clipped
+        var noise = Double.MAX_VALUE
+        var spoke = false
+        var silentMs = 0
+        var elapsed = 0
+        recording = true
+        try {
+            rec.startRecording()
+            while (true) {
+                currentCoroutineContext().ensureActive()               // stop if the user tapped again / closed
+                val n = rec.read(buf, 0, chunk)
+                if (n <= 0) continue
+
+                var sum = 0.0
+                for (i in 0 until n) { val s = buf[i].toDouble(); sum += s * s }
+                val rms = sqrt(sum / n)                                // loudness of this 100 ms
+                val bytes = ByteBuffer.allocate(n * 2).order(ByteOrder.LITTLE_ENDIAN)
+                    .apply { asShortBuffer().put(buf, 0, n) }.array()
+                elapsed += 100
+                level = (rms / 3000).toFloat().coerceIn(0f, 1f)
+
+                if (elapsed <= 300) { noise = minOf(noise, rms); prev = bytes; continue }   // learn background noise
+
+                if (rms > maxOf(500.0, noise * 3)) {                  // speech
+                    if (!spoke) prev?.let { pcm.write(it) }
+                    spoke = true; silentMs = 0
+                } else if (spoke) silentMs += 100                      // silence after speech
+                if (spoke) pcm.write(bytes)
+                prev = bytes
+
+                if (spoke && silentMs >= 1200) break                  // finished speaking
+                if (!spoke && elapsed >= waitMs) return null           // nobody spoke
+                if (elapsed >= 15_000) break                           // hard limit
+            }
+        } finally {
+            runCatching { rec.stop() }
+            rec.release()
+            recording = false; level = 0f
+        }
+        return wav(pcm.toByteArray(), rate)
+    }
+
+    // Raw PCM → WAV file bytes (44-byte header)
+    private fun wav(pcm: ByteArray, rate: Int): ByteArray =
+        ByteBuffer.allocate(44 + pcm.size).order(ByteOrder.LITTLE_ENDIAN).apply {
+            put("RIFF".toByteArray()); putInt(36 + pcm.size); put("WAVE".toByteArray())
+            put("fmt ".toByteArray()); putInt(16)
+            putShort(1.toShort())                                      // PCM
+            putShort(1.toShort())                                      // mono
+            putInt(rate); putInt(rate * 2)                             // sample rate, byte rate
+            putShort(2.toShort()); putShort(16.toShort())              // block align, bits per sample
+            put("data".toByteArray()); putInt(pcm.size); put(pcm)
+        }.array()
+
+    // Upload WAV to Groq Whisper, get text back
+    private fun transcribe(wav: ByteArray): String {
+        val boundary = "vigil${System.currentTimeMillis()}"
+        val conn = URL("$GROQ_URL/audio/transcriptions").openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 10_000; conn.readTimeout = 20_000
+        conn.setRequestProperty("Authorization", "Bearer ${BuildConfig.LLM_API_KEY}")
+        conn.setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+
+        // Spelling hints: your custom words first, then contact names (Whisper limit ~224 tokens)
+        val words = Memory.words(this).take(300)
+        val hint = "Voice command to an assistant called Vigil in Bengaluru. " +
+                "Words: $words. Contact names: $contactHint"
+
+        conn.outputStream.use { out ->
+            fun field(name: String, value: String) = out.write(
+                "--$boundary\r\nContent-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n".toByteArray())
+            field("model", "whisper-large-v3-turbo")
+            field("language", "en")
+            field("temperature", "0")
+            field("response_format", "json")
+            field("prompt", hint)
+            out.write(("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n" +
+                    "Content-Type: audio/wav\r\n\r\n").toByteArray())
+            out.write(wav)
+            out.write("\r\n--$boundary--\r\n".toByteArray())
+        }
+
+        val ok = conn.responseCode in 200..299
+        val res = (if (ok) conn.inputStream else conn.errorStream).bufferedReader().use { it.readText() }
+        if (conn.responseCode == 429) error("speech limit reached, wait a minute")
+        if (!ok) error("HTTP ${conn.responseCode}: ${res.take(120)}")
+        return JSONObject(res).optString("text").trim()
+    }
+
+    // Contact names (starred first) as spelling hints for Whisper
+    private fun contactNames(): String {
+        if (checkSelfPermission(Manifest.permission.READ_CONTACTS) != PackageManager.PERMISSION_GRANTED) return ""
+        val names = linkedSetOf<String>()
+        contentResolver.query(Phone.CONTENT_URI, arrayOf(Phone.DISPLAY_NAME), null, null, "${Phone.STARRED} DESC")
+            ?.use { c -> while (c.moveToNext()) c.getString(0)?.let { names += it } }
+        return names.joinToString(", ").take(350)                      // leaves room for custom words
     }
 
     // Conversation loop: LLM may call tools, we run them, then it gives the final spoken reply
@@ -195,7 +315,7 @@ class AssistActivity : ComponentActivity() {
         return "Done."
     }
 
-    // One request to the LLM with system prompt + saved memory + history + tools
+    // One request to the LLM with system prompt + saved memory + recent history + tools
     private fun chat(): JSONObject {
         val now = LocalDateTime.now().format(DateTimeFormatter.ofPattern("EEEE, d MMM yyyy, h:mm a"))
         val facts = Memory.all(this)
@@ -214,30 +334,41 @@ class AssistActivity : ComponentActivity() {
                     "Only bring up saved facts when they are relevant. " +
                     "Reply in 1-2 short spoken sentences. No markdown, no emojis. Current date and time: $now.\n\n" +
                     "Long-term memory (facts the user asked you to remember):\n$memoryText"))
-        for (i in 0 until history.length()) messages.put(history.get(i))
 
-        val body = JSONObject()
-            .put("model", BuildConfig.LLM_MODEL)
-            .put("reasoning_effort", "low")
-            .put("messages", messages)
-            .put("tools", Tools.schema)
+        // Only send the recent part of this session (saves tokens). Start at a user message
+        // so an assistant tool request is never separated from its tool results.
+        val start = (0 until history.length()).firstOrNull { i ->
+            i >= history.length() - 12 && history.getJSONObject(i).getString("role") == "user"
+        } ?: 0
+        for (i in start until history.length()) messages.put(history.get(i))
 
-        val conn = URL("${BuildConfig.LLM_BASE_URL}/chat/completions").openConnection() as HttpURLConnection
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.setRequestProperty("Content-Type", "application/json")
-        conn.setRequestProperty("Authorization", "Bearer ${BuildConfig.LLM_API_KEY}")
-        conn.outputStream.use { it.write(body.toString().toByteArray()) }
+        // Main model first, then the fallback if it is rate-limited (429)
+        val models = (listOf(BuildConfig.LLM_MODEL) + FALLBACK_MODELS).distinct()
+        for (model in models) {
+            val body = JSONObject()
+                .put("model", model)
+                .put("reasoning_effort", "low")
+                .put("messages", messages)
+                .put("tools", Tools.schema)
 
-        val ok = conn.responseCode in 200..299
-        val res = (if (ok) conn.inputStream else conn.errorStream).bufferedReader().use { it.readText() }
-        if (!ok) error("HTTP ${conn.responseCode}: ${res.take(150)}")
+            val conn = URL("${BuildConfig.LLM_BASE_URL}/chat/completions").openConnection() as HttpURLConnection
+            conn.requestMethod = "POST"
+            conn.doOutput = true
+            conn.setRequestProperty("Content-Type", "application/json")
+            conn.setRequestProperty("Authorization", "Bearer ${BuildConfig.LLM_API_KEY}")
+            conn.outputStream.use { it.write(body.toString().toByteArray()) }
 
-        return JSONObject(res).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+            if (conn.responseCode == 429) continue                     // this model is busy → try the next
+
+            val ok = conn.responseCode in 200..299
+            val res = (if (ok) conn.inputStream else conn.errorStream).bufferedReader().use { it.readText() }
+            if (!ok) error("HTTP ${conn.responseCode}: ${res.take(150)}")
+            return JSONObject(res).getJSONArray("choices").getJSONObject(0).getJSONObject("message")
+        }
+        error("Groq is busy right now. Wait a minute and try again.")
     }
 
     override fun onDestroy() {
-        stt.destroy()
         tts.shutdown()
         super.onDestroy()
     }
