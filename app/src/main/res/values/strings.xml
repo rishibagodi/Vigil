@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Vigil</string>
+    <string name="a11y_description">Lets Vigil read the text on your screen only when you ask about it, like "summarise this page". Nothing is read in the background.</string>
 </resources>

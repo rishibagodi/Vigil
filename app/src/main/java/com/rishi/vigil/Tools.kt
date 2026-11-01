@@ -47,6 +47,9 @@ object Tools {
     // Tools that use the internet → must run off the main thread
     val network = setOf("weather", "web_search")
 
+    // Tools that only run if the user's own words clearly ask for them (checked in AssistActivity)
+    val needsExplicitAsk = setOf("call_contact", "send_sms")
+
     // One notification, simplified
     data class Notif(val app: String, val pkg: String, val title: String, val text: String)
 
@@ -80,13 +83,13 @@ object Tools {
         "required":["on"]}}},
 
       {"type":"function","function":{"name":"call_contact",
-        "description":"Phone call a contact by name, or a phone number.",
+        "description":"Phone call a contact by name, or a phone number. ONLY when the user explicitly asks to call, ring or phone someone. Never call just because a name was said; if unsure, ask.",
         "parameters":{"type":"object","properties":{
           "name":{"type":"string","description":"Contact name as saved, or a phone number"}},
         "required":["name"]}}},
 
       {"type":"function","function":{"name":"send_sms",
-        "description":"Send an SMS text message to a contact by name, or a phone number. Only use when the user asks for an SMS or text message, not for WhatsApp or other chat apps.",
+        "description":"Send an SMS text message to a contact by name, or a phone number. ONLY when the user explicitly asks for an SMS or text message, not for WhatsApp or other chat apps.",
         "parameters":{"type":"object","properties":{
           "name":{"type":"string","description":"Contact name as saved, or a phone number"},
           "message":{"type":"string","description":"The text to send"}},
@@ -177,7 +180,11 @@ object Tools {
           "to":{"type":"string","description":"Chat or sender name, e.g. Chinni"},
           "message":{"type":"string","description":"The reply text"},
           "app":{"type":"string","description":"Optional app name, e.g. WhatsApp"}},
-        "required":["to","message"]}}}
+        "required":["to","message"]}}},
+
+      {"type":"function","function":{"name":"read_screen",
+        "description":"Get the text currently shown on the user's screen (the app that was open when they opened Vigil). Use when the user says 'this', 'this page', 'this message', 'on my screen', 'summarise this', 'explain this', 'reply to this'. If it fails, tell the user the exact reason it gives.",
+        "parameters":{"type":"object","properties":{},"required":[]}}}
     ]
     """)
 
@@ -481,14 +488,21 @@ object Tools {
                 "Replied to ${titleOf(sbn)} on ${appName(ctx, sbn.packageName)}: $message"
             }
 
+            "read_screen" -> {
+                val text = ScreenContext.text ?: error(ScreenContext.note)   // note explains why there's no text
+                "Screen of ${appName(ctx, ScreenContext.app)}:\n$text"
+            }
+
             else -> "Unknown tool: $name"
         }
     }.getOrElse { "Failed: ${it.message}" }
 
     // Name → (saved name, number). A spoken number is used directly.
+    // Matches whole names or the START of a word only, so "Ava" never matches "Savan".
     private fun findContact(ctx: Context, query: String): Pair<String, String> {
         val q = query.trim()
         if (q.none { it.isLetter() } && q.count { it.isDigit() } >= 6) return q to q
+        check(q.length >= 2) { "That name is too short to look up safely" }
 
         check(ctx.checkSelfPermission(Manifest.permission.READ_CONTACTS) == PackageManager.PERMISSION_GRANTED) {
             "Contacts permission not granted. Open the Vigil app, step 1."
@@ -499,8 +513,10 @@ object Tools {
             "${Phone.DISPLAY_NAME} LIKE ?", arrayOf("%$q%"), null
         )?.use { c -> while (c.moveToNext()) found += c.getString(0) to c.getString(1) }
 
-        return found.firstOrNull { it.first.equals(q, ignoreCase = true) }
-            ?: found.firstOrNull()
+        val ql = q.lowercase()
+        return found.firstOrNull { it.first.equals(q, ignoreCase = true) }         // exact name
+            ?: found.firstOrNull { it.first.lowercase().startsWith(ql) }          // name starts with it
+            ?: found.firstOrNull { it.first.lowercase().contains(" $ql") }        // a later word starts with it
             ?: error("No contact named $q")
     }
 

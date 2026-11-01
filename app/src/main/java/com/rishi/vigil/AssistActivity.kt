@@ -50,6 +50,18 @@ private const val GROQ_URL = "https://api.groq.com/openai/v1"
 // Groq rate limits are per model, so if one is busy we try the other
 private val FALLBACK_MODELS = listOf("openai/gpt-oss-20b", "openai/gpt-oss-120b")
 
+// Phrases that clearly point at what's on the screen ("summarise this page", "explain this", "on my screen")
+private val SCREEN_WORDS = Regex(
+    "\\b(this|these)\\s+(page|article|screen|message|messages|chat|post|email|mail|text|website|site|news|story|error|bill|invite|invitation)\\b" +
+            "|\\b(summari[sz]e|explain|read|translate|describe|check)\\s+(this|it)\\b" +
+            "|\\bwhat('?s| is| does| do)\\s+(this|these)\\b" +
+            "|\\b(on|from)\\s+(my|the)\\s+screen\\b" +
+            "|\\bscreen\\b"
+)
+
+// Tools that only run if YOUR words clearly ask for them (a bare or misheard name never triggers them)
+private val GUARDED_TOOLS = setOf("call_contact", "send_sms", "open_app")
+
 class AssistActivity : ComponentActivity() {
     private var status by mutableStateOf("Starting…")
     private var heard by mutableStateOf("")
@@ -62,8 +74,9 @@ class AssistActivity : ComponentActivity() {
     private var followUp = false                       // true when the mic reopened by itself
     private var listenJob: Job? = null
     private var contactHint = ""                       // contact names → helps Whisper spell them
-    private val toolsUsed = mutableListOf<String>()    // ← new: tools run for the current command
-    private var lastResult = ""                        // ← new: last tool result (for app/call handoff)
+    private val toolsUsed = mutableListOf<String>()    // tools run for the current command
+    private var lastResult = ""                        // last tool result (for app/call handoff)
+    private val openedAt = System.currentTimeMillis()  // assist-structure screen text must be captured around this time
 
     // Whole-utterance phrases that mean "I'm done" (checked after removing punctuation)
     private val stopWords = Regex("^(stop|cancel|thanks|thank you|thats all|that is all|bye|goodbye|nothing|no|no thanks|ok bye)$")
@@ -140,7 +153,10 @@ class AssistActivity : ComponentActivity() {
                     status = "Couldn't transcribe (${it.message}). Tap to try again."
                     return@launch
                 }
-            if (text.isBlank()) { status = "I didn't catch that. Tap to try again."; return@launch }
+            if (text.isBlank()) {                                     // Whisper says it was just noise
+                if (followUp) finish() else status = "I didn't catch that. Tap to try again."
+                return@launch
+            }
 
             // 3. Same flow as before
             onHeard(text)
@@ -157,13 +173,13 @@ class AssistActivity : ComponentActivity() {
             if (it is CancellationException) throw it
             "Error: ${it.message}"
         }
-        Memory.log(this, text, toolsUsed.toList(), reply)             // ← new: save to command history
+        Memory.log(this, text, toolsUsed.toList(), reply)             // save to command history
         if (closeAfter) { finish(); return }                          // get out of the way of the call/app
         status = "Vigil"
         tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "vigil")
     }
 
-    // Records 16 kHz mono audio. Returns WAV bytes, or null if nobody spoke within waitMs.
+    // Records 16 kHz mono audio. Returns WAV bytes, or null if nobody really spoke within waitMs.
     @SuppressLint("MissingPermission")
     private suspend fun record(waitMs: Int): ByteArray? {
         val rate = 16_000
@@ -179,6 +195,7 @@ class AssistActivity : ComponentActivity() {
         var noise = Double.MAX_VALUE
         var spoke = false
         var silentMs = 0
+        var speechMs = 0                                              // how long you actually spoke
         var elapsed = 0
         recording = true
         try {
@@ -201,6 +218,7 @@ class AssistActivity : ComponentActivity() {
                 if (rms > maxOf(500.0, noise * 3)) {                  // speech
                     if (!spoke) prev?.let { pcm.write(it) }
                     spoke = true; silentMs = 0
+                    speechMs += 100
                 } else if (spoke) silentMs += 100                      // silence after speech
                 if (spoke) pcm.write(bytes)
                 prev = bytes
@@ -214,6 +232,8 @@ class AssistActivity : ComponentActivity() {
             rec.release()
             recording = false; level = 0f
         }
+        // Short bursts of noise are not speech (stricter in follow-up mode, where phantom words came from)
+        if (speechMs < (if (followUp) 600 else 400)) return null
         return wav(pcm.toByteArray(), rate)
     }
 
@@ -229,7 +249,7 @@ class AssistActivity : ComponentActivity() {
             put("data".toByteArray()); putInt(pcm.size); put(pcm)
         }.array()
 
-    // Upload WAV to Groq Whisper, get text back
+    // Upload WAV to Groq Whisper, get text back ("" if Whisper thinks it was not real speech)
     private fun transcribe(wav: ByteArray): String {
         val boundary = "vigil${System.currentTimeMillis()}"
         val conn = URL("$GROQ_URL/audio/transcriptions").openConnection() as HttpURLConnection
@@ -250,7 +270,7 @@ class AssistActivity : ComponentActivity() {
             field("model", "whisper-large-v3-turbo")
             field("language", "en")
             field("temperature", "0")
-            field("response_format", "json")
+            field("response_format", "verbose_json")                  // includes "is this speech?" scores
             field("prompt", hint)
             out.write(("--$boundary\r\nContent-Disposition: form-data; name=\"file\"; filename=\"speech.wav\"\r\n" +
                     "Content-Type: audio/wav\r\n\r\n").toByteArray())
@@ -262,7 +282,18 @@ class AssistActivity : ComponentActivity() {
         val res = (if (ok) conn.inputStream else conn.errorStream).bufferedReader().use { it.readText() }
         if (conn.responseCode == 429) error("speech limit reached, wait a minute")
         if (!ok) error("HTTP ${conn.responseCode}: ${res.take(120)}")
-        return JSONObject(res).optString("text").trim()
+
+        val json = JSONObject(res)
+        // Discard if Whisper itself isn't confident this was speech (stops phantom words like "Samaraz Dispatch")
+        val segs = json.optJSONArray("segments")
+        if (segs != null && segs.length() > 0) {
+            val doubtful = (0 until segs.length()).all {
+                val s = segs.getJSONObject(it)
+                s.optDouble("no_speech_prob", 0.0) > 0.5 || s.optDouble("avg_logprob", 0.0) < -1.0
+            }
+            if (doubtful) return ""
+        }
+        return json.optString("text").trim()
     }
 
     // Contact names (starred first) as spelling hints for Whisper
@@ -274,10 +305,47 @@ class AssistActivity : ComponentActivity() {
         return names.joinToString(", ").take(350)                      // leaves room for custom words
     }
 
+    // Guarded tools only run if YOUR words clearly asked for them
+    private fun explicitlyAsked(tool: String, said: String): Boolean {
+        val s = said.lowercase()
+        return when (tool) {
+            "call_contact" -> Regex("\\b(call|ring|phone|dial)\\b").containsMatchIn(s)
+            "send_sms" -> Regex("\\b(text|sms|message|send)\\b").containsMatchIn(s)
+            "open_app" -> Regex("\\b(open|launch|start|show|go to|switch to)\\b").containsMatchIn(s)
+            else -> true
+        }
+    }
+
+    // Text of the screen behind Vigil:
+    // 1st choice: Accessibility service (reliable, works in Chrome and most apps)
+    // 2nd choice: what Android's assistant API sent when Vigil opened
+    private fun screenText(): String {
+        val a11y = VigilAccessibilityService.instance
+        if (a11y != null) {
+            val (pkg, text) = runCatching { a11y.screenText() }.getOrNull()
+                ?: return "(No screen text available: couldn't find the app behind Vigil.)"
+            return if (text.isNotBlank()) "App: $pkg\n$text"
+            else "(No screen text available: that screen has no readable text, e.g. an image or video.)"
+        }
+        val fresh = ScreenContext.capturedAt >= openedAt - 5_000
+        return when {
+            fresh && ScreenContext.text != null -> ScreenContext.text!!
+            else -> "(No screen text available: turn on Vigil in Settings → Accessibility → " +
+                    "Downloaded apps → Vigil. The Vigil app's step 6 opens that page.)"
+        }
+    }
+
     // Conversation loop: LLM may call tools, we run them, then it gives the final spoken reply
     private suspend fun ask(text: String): String {
-        toolsUsed.clear()                                              // ← new
-        history.put(JSONObject().put("role", "user").put("content", text))
+        toolsUsed.clear()
+
+        // "Summarise this page" etc. → attach the screen text ourselves, so the LLM can't skip it
+        val content = if (SCREEN_WORDS.containsMatchIn(text.lowercase())) {
+            toolsUsed += "screen"
+            val screen = withContext(Dispatchers.IO) { screenText() }
+            "$text\n\n[Text currently on the user's screen]\n$screen"
+        } else text
+        history.put(JSONObject().put("role", "user").put("content", content))
 
         repeat(5) {                                                    // max 5 tool rounds (multi-step)
             val msg = withContext(Dispatchers.IO) { chat() }
@@ -301,12 +369,18 @@ class AssistActivity : ComponentActivity() {
                 val name = fn.getString("name")
                 val args = JSONObject(fn.optString("arguments").ifBlank { "{}" })
                 val ctx = this@AssistActivity
-                val result = if (name in Tools.network)
-                    withContext(Dispatchers.IO) { Tools.run(ctx, name, args) }   // internet tools off main thread
-                else Tools.run(ctx, name, args)
+                val result = when {
+                    name in GUARDED_TOOLS && !explicitlyAsked(name, text) ->              // safety guard
+                        "Not done: the user did not clearly ask for this. Ask what they want."
+                    name == "read_screen" ->
+                        withContext(Dispatchers.IO) { screenText() }
+                    name in Tools.network ->
+                        withContext(Dispatchers.IO) { Tools.run(ctx, name, args) }        // internet tools off main thread
+                    else -> Tools.run(ctx, name, args)
+                }
 
-                toolsUsed += name                                      // ← new
-                lastResult = result                                    // ← new
+                toolsUsed += name
+                lastResult = result
 
                 // Opened an app or started a call → Vigil should close
                 if (result.startsWith("Opened") || result.startsWith("Calling")) closeAfter = true
@@ -317,7 +391,7 @@ class AssistActivity : ComponentActivity() {
                     .put("content", result))
             }
 
-            if (closeAfter) return lastResult                          // ← new: e.g. "Calling Arjun" in history
+            if (closeAfter) return lastResult                          // e.g. "Calling Arjun" in history
         }
         return "Done."
     }
@@ -334,6 +408,10 @@ class AssistActivity : ComponentActivity() {
                     "Use the tools to act on the phone when asked. If the user asks for several things, " +
                     "call every tool needed, then confirm all of them in one short reply. " +
                     "Use earlier messages in this conversation to understand follow-ups like 'make it 7' or 'turn it off'. " +
+                    "When a user message includes a '[Text currently on the user's screen]' section, 'this' and 'this page' " +
+                    "mean that text: answer from it directly and never ask which page. Ignore menus, buttons and ads in it. " +
+                    "If it says no screen text is available, tell the user the exact reason given in brackets. " +
+                    "If the user's words are unclear, random or just a name, ask what they want instead of acting. " +
                     "For weather use the weather tool. For news, scores, prices or anything recent, use web_search " +
                     "and summarise the answer; never read out URLs. " +
                     "When the user says 'remember ...', use the remember tool and convert relative dates like " +

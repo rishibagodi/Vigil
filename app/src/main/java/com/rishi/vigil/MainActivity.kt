@@ -80,6 +80,10 @@ class MainActivity : ComponentActivity() {
                         Text("5. Allow notification access")
                     }
 
+                    Button({ startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }, Modifier.fillMaxWidth()) {
+                        Text("6. Allow screen reading (Accessibility)")
+                    }
+
                     HorizontalDivider()
 
                     // Custom vocabulary for Whisper
