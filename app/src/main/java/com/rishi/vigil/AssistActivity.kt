@@ -62,6 +62,8 @@ class AssistActivity : ComponentActivity() {
     private var followUp = false                       // true when the mic reopened by itself
     private var listenJob: Job? = null
     private var contactHint = ""                       // contact names → helps Whisper spell them
+    private val toolsUsed = mutableListOf<String>()    // ← new: tools run for the current command
+    private var lastResult = ""                        // ← new: last tool result (for app/call handoff)
 
     // Whole-utterance phrases that mean "I'm done" (checked after removing punctuation)
     private val stopWords = Regex("^(stop|cancel|thanks|thank you|thats all|that is all|bye|goodbye|nothing|no|no thanks|ok bye)$")
@@ -155,6 +157,7 @@ class AssistActivity : ComponentActivity() {
             if (it is CancellationException) throw it
             "Error: ${it.message}"
         }
+        Memory.log(this, text, toolsUsed.toList(), reply)             // ← new: save to command history
         if (closeAfter) { finish(); return }                          // get out of the way of the call/app
         status = "Vigil"
         tts.speak(reply, TextToSpeech.QUEUE_FLUSH, null, "vigil")
@@ -273,6 +276,7 @@ class AssistActivity : ComponentActivity() {
 
     // Conversation loop: LLM may call tools, we run them, then it gives the final spoken reply
     private suspend fun ask(text: String): String {
+        toolsUsed.clear()                                              // ← new
         history.put(JSONObject().put("role", "user").put("content", text))
 
         repeat(5) {                                                    // max 5 tool rounds (multi-step)
@@ -301,6 +305,9 @@ class AssistActivity : ComponentActivity() {
                     withContext(Dispatchers.IO) { Tools.run(ctx, name, args) }   // internet tools off main thread
                 else Tools.run(ctx, name, args)
 
+                toolsUsed += name                                      // ← new
+                lastResult = result                                    // ← new
+
                 // Opened an app or started a call → Vigil should close
                 if (result.startsWith("Opened") || result.startsWith("Calling")) closeAfter = true
 
@@ -310,7 +317,7 @@ class AssistActivity : ComponentActivity() {
                     .put("content", result))
             }
 
-            if (closeAfter) return "Done."
+            if (closeAfter) return lastResult                          // ← new: e.g. "Calling Arjun" in history
         }
         return "Done."
     }

@@ -18,15 +18,21 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 class MainActivity : ComponentActivity() {
     private var facts by mutableStateOf(listOf<String>())
     private var words by mutableStateOf("")
+    private var history by mutableStateOf(listOf<Memory.Entry>())
+    private val timeFmt = DateTimeFormatter.ofPattern("EEE d MMM, h:mm a")
 
     override fun onResume() {
         super.onResume()
         facts = Memory.all(this)                       // refresh every time the app is opened
         words = Memory.words(this)
+        history = Memory.history(this)
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -91,6 +97,7 @@ class MainActivity : ComponentActivity() {
 
                     HorizontalDivider()
 
+                    // Long-term memory
                     Text("Vigil remembers (${facts.size})", style = MaterialTheme.typography.titleMedium)
                     if (facts.isEmpty()) Text("Nothing yet. Say \"Remember …\" to Vigil.")
                     else facts.forEach { Text("• $it") }
@@ -101,6 +108,40 @@ class MainActivity : ComponentActivity() {
                     }, Modifier.fillMaxWidth()) {
                         Text("Forget everything")
                     }
+
+                    HorizontalDivider()
+
+                    // Command history
+                    Text("Recent commands (${history.size})", style = MaterialTheme.typography.titleMedium)
+                    if (history.isEmpty()) Text("No commands yet.")
+                    else history.take(20).forEach { e ->
+                        Card(Modifier.fillMaxWidth()) {
+                            Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                Text(Instant.ofEpochMilli(e.time).atZone(ZoneId.systemDefault()).format(timeFmt),
+                                    style = MaterialTheme.typography.labelSmall)
+                                Text("You: ${e.said}", style = MaterialTheme.typography.bodyMedium)
+                                if (e.tools.isNotEmpty())
+                                    Text("Tools: ${e.tools}", style = MaterialTheme.typography.bodySmall)
+                                Text("Vigil: ${e.reply}", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
+                    }
+
+                    if (history.isNotEmpty()) OutlinedButton({
+                        Memory.clearHistory(this@MainActivity)
+                        history = emptyList()
+                    }, Modifier.fillMaxWidth()) {
+                        Text("Clear history")
+                    }
+
+                    HorizontalDivider()
+
+                    // Data credits (required by Open-Meteo's free licence)
+                    TextButton({ startActivity(Intent(Intent.ACTION_VIEW, Uri.parse("https://open-meteo.com"))) }) {
+                        Text("Weather data by Open-Meteo.com", style = MaterialTheme.typography.bodySmall)
+                    }
+
+                    Spacer(Modifier.height(24.dp))
                 }
             }
         }
